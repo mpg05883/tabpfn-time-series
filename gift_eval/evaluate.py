@@ -5,15 +5,15 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 
+import argparse
 import csv
 import logging
-import argparse
-import wandb
+import pickle
 from pathlib import Path
-from typing import Tuple, List
+from typing import List, Tuple
 
-from gluonts.model import evaluate_model
-from gluonts.time_feature import get_seasonality
+import pandas as pd
+import wandb
 from gluonts.ev.metrics import (
     MAE,
     MAPE,
@@ -26,14 +26,16 @@ from gluonts.ev.metrics import (
     SMAPE,
     MeanWeightedSumQuantileLoss,
 )
+from gluonts.model import evaluate_forecasts
+from gluonts.time_feature import get_seasonality
+from serde import serialize_forecasts
 
 from gift_eval.data import Dataset
 from gift_eval.dataset_definition import (
-    MED_LONG_DATASETS,
-    ALL_DATASETS,
     DATASET_PROPERTIES_MAP,
+    MED_LONG_DATASETS,
 )
-from gift_eval.tabpfn_ts_wrapper import TabPFNTSPredictor, TabPFNMode
+from gift_eval.tabpfn_ts_wrapper import TabPFNMode, TabPFNTSPredictor
 
 # Instantiate the metrics
 metrics = [
@@ -52,6 +54,10 @@ metrics = [
     ),
 ]
 
+metrics = [
+    MSE(forecast_type="mean"),
+]
+
 pretty_names = {
     "saugeenday": "saugeen",
     "temperature_rain_with_missing": "temperature_rain",
@@ -67,6 +73,19 @@ class WarningFilter(logging.Filter):
 
     def filter(self, record):
         return self.text_to_filter not in record.getMessage()
+    
+def get_dataset_config(dataset: Dataset) -> str:
+    name = dataset.name
+    pretty_names = {
+        "saugeenday": "saugeen",
+        "temperature_rain_with_missing": "temperature_rain",
+        "kdd_cup_2018_with_missing": "kdd_cup_2018",
+        "car_parts_with_missing": "car_parts",
+    }
+    name = name.split("/")[0] if "/" in name else name
+    cleaned_name = pretty_names.get(name.lower(), name.lower())
+    cleaned_freq = dataset.freq.split("-")[0]
+    return f"{cleaned_name}/{cleaned_freq}/{dataset.term.value}"
 
 
 gts_logger = logging.getLogger("gluonts.model.forecast")
@@ -82,7 +101,7 @@ logger = logging.getLogger(__name__)
 def construct_evaluation_data(
     dataset_name: str,
     dataset_storage_path: Path,
-    terms: List[str] = ["short", "medium", "long"],
+    terms: str,
 ) -> List[Tuple[Dataset, dict]]:
     sub_datasets = []
 
@@ -104,6 +123,7 @@ def construct_evaluation_data(
             ds_key = pretty_names.get(ds_key, ds_key)
             ds_freq = DATASET_PROPERTIES_MAP[ds_key]["frequency"]
 
+        print(f'term: {term}')
         # Initialize the dataset
         to_univariate = (
             False
@@ -146,16 +166,16 @@ def create_csv_file(csv_file_path):
                 "dataset",
                 "model",
                 "eval_metrics/MSE[mean]",
-                "eval_metrics/MSE[0.5]",
-                "eval_metrics/MAE[0.5]",
-                "eval_metrics/MASE[0.5]",
-                "eval_metrics/MAPE[0.5]",
-                "eval_metrics/sMAPE[0.5]",
-                "eval_metrics/MSIS",
-                "eval_metrics/RMSE[mean]",
-                "eval_metrics/NRMSE[mean]",
-                "eval_metrics/ND[0.5]",
-                "eval_metrics/mean_weighted_sum_quantile_loss",
+                # "eval_metrics/MSE[0.5]",
+                # "eval_metrics/MAE[0.5]",
+                # "eval_metrics/MASE[0.5]",
+                # "eval_metrics/MAPE[0.5]",
+                # "eval_metrics/sMAPE[0.5]",
+                # "eval_metrics/MSIS",
+                # "eval_metrics/RMSE[mean]",
+                # "eval_metrics/NRMSE[mean]",
+                # "eval_metrics/ND[0.5]",
+                # "eval_metrics/mean_weighted_sum_quantile_loss",
                 "domain",
                 "num_variates",
             ]
@@ -175,16 +195,16 @@ def append_results_to_csv(
                 dataset_metadata["full_name"],
                 model_name,
                 res["MSE[mean]"][0],
-                res["MSE[0.5]"][0],
-                res["MAE[0.5]"][0],
-                res["MASE[0.5]"][0],
-                res["MAPE[0.5]"][0],
-                res["sMAPE[0.5]"][0],
-                res["MSIS"][0],
-                res["RMSE[mean]"][0],
-                res["NRMSE[mean]"][0],
-                res["ND[0.5]"][0],
-                res["mean_weighted_sum_quantile_loss"][0],
+                # res["MSE[0.5]"][0],
+                # res["MAE[0.5]"][0],
+                # res["MASE[0.5]"][0],
+                # res["MAPE[0.5]"][0],
+                # res["sMAPE[0.5]"][0],
+                # res["MSIS"][0],
+                # res["RMSE[mean]"][0],
+                # res["NRMSE[mean]"][0],
+                # res["ND[0.5]"][0],
+                # res["mean_weighted_sum_quantile_loss"][0],
                 DATASET_PROPERTIES_MAP[dataset_metadata["key"]]["domain"],
                 DATASET_PROPERTIES_MAP[dataset_metadata["key"]]["num_variates"],
             ]
@@ -217,25 +237,39 @@ def log_results_to_wandb(
 
 
 def main(args):
-    if args.dataset not in ALL_DATASETS:
-        raise ValueError(f"Invalid dataset: {args.dataset}")
-    logger.info(f"Evaluating dataset {args.dataset}")
+    metadata_path = Path("data") / "meta" / "train_test" / "metadata.csv"
+    metadata_df = pd.read_csv(metadata_path, usecols=["name", "term"])
+    name, term = metadata_df.iloc[args.task_index][["name", "term"]]
 
-    # Check if the dataset storage path exists
-    if not Path(args.dataset_storage_path).exists():
-        raise ValueError(
-            f"Dataset storage path {args.dataset_storage_path} does not exist"
-        )
+    cleaned_name = f"{name}_{term}".lower().replace("/", "_")
 
     # Initialize wandb
     wandb.init(
-        project=args.wandb_project,
-        name=f"{args.model_name}/{args.dataset}",
-        config=vars(args),
-        tags=[args.model_name] + args.wandb_tags.split(",") if args.wandb_tags else [],
+        project="EnsembleTS",
+        entity="mpgee-usc",
+        name=cleaned_name,
+        tags=[
+            "model=tabpfn_ts",
+            "eval",
+            f"dataset_name={name}",
+            f"term={term}",
+            "debug",
+        ],
+        # job_type="eval",
+        job_type="debug",
+        group="tabpfn_ts",
+        mode="online",
     )
 
-    output_dir = args.output_dir / args.model_name / args.dataset
+    table = wandb.Table(
+        columns=[
+            "model",
+            "val_loss",
+            "forecast_artifact",
+        ]
+    )
+
+    output_dir = args.output_dir / args.model_name / get_dataset_config(Dataset(name=name, term=term, storage_path=Path(args.dataset_storage_path),),)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_csv_path = output_dir / "results.csv"
 
@@ -244,8 +278,15 @@ def main(args):
 
     # Construct evaluation data (i.e. sub-datasets) for this dataset
     # (some datasets contain different forecasting terms, e.g. short, medium, long)
+    print(f'name: {name}')
+    print(f'storage path: {args.dataset_storage_path}')
+    
+    print(f'term {term}')
+    
     sub_datasets = construct_evaluation_data(
-        args.dataset, args.dataset_storage_path, args.terms
+        name,
+        Path(args.dataset_storage_path),
+        [term],
     )
 
     # Evaluate model
@@ -262,14 +303,16 @@ def main(args):
         tabpfn_predictor = TabPFNTSPredictor(
             ds_prediction_length=sub_dataset.prediction_length,
             ds_freq=sub_dataset.freq,
-            # tabpfn_mode=TabPFNMode.LOCAL,
-            tabpfn_mode=TabPFNMode.CLIENT,
+            tabpfn_mode=TabPFNMode.LOCAL,
+            # tabpfn_mode=TabPFNMode.CLIENT,
             context_length=4096,
             debug=args.debug,
         )
 
-        res = evaluate_model(
-            tabpfn_predictor,
+        forecasts = list(tabpfn_predictor.predict(sub_dataset.test_data))
+
+        res = evaluate_forecasts(
+            forecasts=forecasts,
             test_data=sub_dataset.test_data,
             metrics=metrics,
             axis=None,
@@ -278,11 +321,24 @@ def main(args):
             seasonality=dataset_metadata["season_length"],
         )
 
-        # Log results to wandb
-        log_results_to_wandb(
-            res=res,
-            dataset_metadata=dataset_metadata,
+        parts = [
+            "./results/forecasts",
+            get_dataset_config(sub_dataset),
+        ]
+
+        forecasts_path = Path(*parts) / "tabpfn_ts.pkl"
+
+        forecast_dict = serialize_forecasts(forecasts)
+
+        with open(forecasts_path, "wb") as f:
+            pickle.dump(forecast_dict, f)
+
+        forecast_artifact = wandb.Artifact(
+            name=f"{forecasts_path.stem}_forecasts",
+            type="forecast",
         )
+        forecast_artifact.add_file(forecasts_path)
+        wandb.log_artifact(forecast_artifact)
 
         # Write results to csv
         append_results_to_csv(
@@ -292,38 +348,45 @@ def main(args):
             model_name=args.model_name,
         )
 
+        forecast_artifact = None
+
+        table.add_data(
+            args.model_name,
+            res.values[0].item(),
+            forecast_artifact,
+        )
+
+    table_artifact = wandb.Artifact(
+        name=f"{name.replace('/','_')}_{term}",
+        type="evaluation",
+    )
+    table_artifact.add(table, name="evaluation")
+    wandb.log_artifact(table_artifact)
+
     # Finish wandb run
     wandb.finish()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="tabpfn-ts-paper")
-    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--model_name", type=str, default="tabpfn_ts")
+    parser.add_argument("--task_index", type=int, required=True)
+
+
+    output_dir = Path("output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    parser.add_argument("--output_dir", type=str, default=str(output_dir))
+
     parser.add_argument(
-        "--output_dir", type=str, default=str(Path(__file__).parent / "results")
-    )
-    parser.add_argument(
-        "--terms",
+        "--dataset_storage_path",
         type=str,
-        default="short,medium,long",
-        help="Comma-separated list of terms to evaluate",
-    )
-    parser.add_argument(
-        "--dataset_storage_path", type=str, default=str(Path(__file__).parent / "data")
+        default=str(Path(__file__).parent / "datasets" / "train_test"),
     )
     parser.add_argument("--debug", action="store_true")
-
-    # Wandb settings
-    parser.add_argument("--wandb_project", type=str, default="tabpfn-ts-experiments")
-    parser.add_argument(
-        "--wandb_tags", type=str, default=""
-    )  # model_name will be added later anyway
 
     args = parser.parse_args()
     args.dataset_storage_path = Path(args.dataset_storage_path)
     args.output_dir = Path(args.output_dir)
-    args.terms = args.terms.split(",")
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)

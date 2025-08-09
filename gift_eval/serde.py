@@ -168,9 +168,12 @@ def serialize_forecasts(
     """
     # TODO: Change this so it can serialize forecasts into Hydra-compatible format
     if isinstance(forecasts[0], QuantileForecast):
+        obj = forecasts[0]
+        attrs = [attr for attr in dir(obj) if not callable(getattr(obj, attr)) and not attr.startswith("__")]
+        print(attrs)
         return {
-            "forecast_arrays": [
-                forecast.forecast_arrays.tolist() for forecast in forecasts
+            "forecast_array": [
+                forecast.forecast_array.tolist() for forecast in forecasts
             ],
             "start_date": [str(forecast.start_date) for forecast in forecasts],
             "freq": [forecast.freq for forecast in forecasts],
